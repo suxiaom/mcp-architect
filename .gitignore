@@ -1,0 +1,11 @@
+# .gitignore
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+venv/
+.env
+.DS_Store
+business_index.json
+business_index.json.bak
