@@ -13,7 +13,7 @@ MCP Architect 是一个基于 Model Context Protocol (MCP) 的工具集。它通
 这会将工具安装在隔离环境中，不会污染你的全局 Python 环境。
 code
 Bash
-# 替换为你的 GitHub 仓库地址
+# https://github.com/suxiaom/mcp-architect
 pipx install git+https://github.com/your-username/mcp-architect.git
 方式 2：使用 pip
 code
