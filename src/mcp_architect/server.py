@@ -79,6 +79,16 @@ def calculate_match_score(query: str, text: str) -> float:
 
     return 0.0
 
+# [近场提醒] 附加在"模型即将开始干活"的读操作返回末尾。
+# 目的：把"任务结束要写回索引"这一要求，从遥远的系统提示(CLAUDE.md)
+# 搬到模型实际调用工具的当下上下文里，降低收尾时的遗忘率。
+# 注意：仅在少数关键路径附加，避免到处都加导致模型对提醒脱敏。
+WRITEBACK_REMINDER = (
+    "\n\n———\n"
+    "⚠️ 收尾提醒：如果本次任务【改动了代码】或让你【对业务产生了新的理解】，"
+    "请在结束前调用 update_business_index 把变更写回索引——否则本次任务视为未闭环。"
+)
+
 # --- MCP 工具定义 ---
 
 @mcp.tool()
@@ -123,7 +133,9 @@ def search_business_index(keyword: str) -> str:
             f"以便后续会话可以直接复用，而不必重新读代码。"
         )
 
-    return json.dumps(top_results, ensure_ascii=False, indent=2)
+    # [改动] 命中结果时，在数据之后附加近场写回提醒。
+    # 这是模型基于索引开始干活的现场，原本此路径无任何提醒。
+    return json.dumps(top_results, ensure_ascii=False, indent=2) + WRITEBACK_REMINDER
 
 @mcp.tool()
 def check_stale_indexes() -> str:
@@ -157,7 +169,8 @@ def check_stale_indexes() -> str:
                 )
 
     if not stale_items:
-        return "✅ 已索引的模块目前都是最新的（基于文件修改时间）。"
+        # [改动] 此处模型即将基于现有索引开始干活，附加近场写回提醒。
+        return "✅ 已索引的模块目前都是最新的（基于文件修改时间）。" + WRITEBACK_REMINDER
 
     return "以下模块的索引可能已过期，建议读取代码并调用 update_business_index：\n" + "\n".join(stale_items)
 
