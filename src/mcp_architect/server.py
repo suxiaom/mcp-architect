@@ -2,6 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "fastmcp",
+#     "jieba",
 # ]
 # ///
 
@@ -10,144 +11,273 @@ import json
 import os
 import re
 import time
+import uuid
 import shutil
 import difflib
 from pathlib import Path
 from fastmcp import FastMCP
 
+# jieba 用于中文分词以改善搜索匹配。容错导入：未安装时退化为"不分词"，
+# 搜索仍可用（只是模糊匹配能力下降），不会让整个 server 崩溃。
+try:
+    import jieba
+    jieba.setLogLevel("ERROR")  # 静默 jieba 的加载日志，避免污染 MCP stdio
+    _HAS_JIEBA = True
+except Exception:
+    _HAS_JIEBA = False
+
 # 1. 初始化 MCP Server
 mcp = FastMCP("business-index-server")
 
-# 2. 定义索引文件路径
-# [改动] 基于脚本自身位置定位，而非进程 CWD。
-# setup 会把本脚本复制进项目根目录，因此索引始终与脚本同目录，不受启动目录影响。
+# 2. 三类索引分文件存储
+# 设计：类型由"记录存在哪个文件"决定，因此记录内部不再保存 type 字段。
+# 路径基于脚本自身位置（__file__）定位，不依赖进程 CWD——
+# setup 会把本脚本复制进项目根目录，故索引始终与脚本同目录。
 BASE_DIR = Path(__file__).parent
-INDEX_FILE = BASE_DIR / "business_index.json"
-BACKUP_FILE = BASE_DIR / "business_index.json.bak"
+STORE_FILES = {
+    "module": BASE_DIR / "modules.json",
+    "workflow": BASE_DIR / "workflows.json",
+    "decision": BASE_DIR / "decisions.json",
+}
 
-# --- 辅助函数 ---
+# ============================================================
+# 数据模型约定（重要，便于理解下面的代码）
+# ------------------------------------------------------------
+# 三种记录都有一个 "id" 字段，但它的语义是【组号】，不是行的唯一标识：
+#   - 同一次"因果事件"（一次代码改动 + 对应的业务语义/决策）产生的
+#     module / workflow / decision，共享【同一个 id】。
+#   - 不同的因果事件，id 不同。
+#   - 因此"由果找因"= 拿着 module 的 id，去 workflow/decision 文件里查同 id 的记录。
+#
+# module / workflow 额外有版本链字段：
+#   - is_current: 是否为该 path 的当前版本（搜索只命中当前版）。
+#   - prev_id:    指向同一 path 上一版本的【组号 id】；首版为 None。
+#   - 回溯 = 顺着 prev_id 往回找更早版本。
+#
+# decision 不做版本链：它是历史事件序列，只追加、不覆盖、无 is_current/prev_id。
+# ============================================================
 
-def load_index():
-    if not os.path.exists(INDEX_FILE):
-        return {
-            "project_meta": {"name": "Project Memory", "description": "Auto-generated business index"},
-            "modules": [],
-            "workflows": [],
-            "decisions": []
-        }
-    with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return {"modules": [], "workflows": [], "decisions": []}
 
-def save_index(data):
-    # [增强功能 1] 自动备份：每次写入前备份旧文件
-    if os.path.exists(INDEX_FILE):
-        shutil.copy(INDEX_FILE, BACKUP_FILE)
+# --- 辅助函数：读写 ---
 
-    with open(INDEX_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def load_store(rec_type: str):
+    """读取某一类记录的列表。文件不存在或损坏时返回空列表。"""
+    path = STORE_FILES[rec_type]
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_store(rec_type: str, items: list):
+    """写入某一类记录的列表。写入前自动备份旧文件。"""
+    path = STORE_FILES[rec_type]
+    if os.path.exists(path):
+        shutil.copy(path, str(path) + ".bak")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+
+def generate_group_id() -> str:
+    """生成一个唯一的组号 id。纯标识，不掺业务内容。"""
+    return f"g_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+
 
 def clean_json_string(s: str) -> str:
-    """清理 Markdown 标记"""
+    """清理 Markdown 代码块标记。"""
     s = s.strip()
     s = re.sub(r"^```(json)?", "", s, flags=re.MULTILINE)
     s = re.sub(r"```$", "", s, flags=re.MULTILINE)
     return s.strip()
 
+
+def _tokenize(text: str) -> list:
+    """把文本切成片段，用于逐片段匹配。
+    有 jieba 时用中文分词；没有时退化为：按非字母数字分隔 + 整体保留。
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if _HAS_JIEBA:
+        # jieba 切词，过滤掉纯空白片段
+        return [t for t in jieba.cut(text) if t.strip()]
+    # 退化方案：按标点/空白切，至少保证英文单词能切开
+    parts = [p for p in re.split(r"[\s,，。、;；:：/\\\-_()（）\[\]]+", text) if p]
+    return parts or [text]
+
+
 def calculate_match_score(query: str, text: str) -> float:
     """
-    [增强功能 4] 搜索核心算法
-    1. 包含匹配 (权重高)
-    2. 模糊匹配 (difflib, 处理拼写错误或相似词)
+    搜索打分（0~1）：
+    1. 精确/部分包含 -> 1.0（query 作为子串原样出现在 text 中）
+    2. 否则：把 text 分词，query 与每个片段分别算相似度，取最高分。
+       这修复了旧实现"短 query 对整段长 text 算 ratio 被长度稀释"的失效问题。
+       相似度 > 0.6 时给分（similarity * 0.8）。
     """
-    if not text:
+    if not text or not query:
         return 0.0
 
-    query = query.lower()
-    text = text.lower()
+    q = query.lower().strip()
+    t = text.lower()
 
-    # 1. 精确/部分包含 (权重 1.0)
-    if query in text:
+    # 1. 子串包含：直接满分
+    if q in t:
         return 1.0
 
-    # 2. 模糊匹配 (权重 0.8) - 处理 "paymnt" vs "payment"
-    similarity = difflib.SequenceMatcher(None, query, text).ratio()
-    if similarity > 0.6:
-        return similarity * 0.8
+    # 2. 分词后逐片段比，取最高
+    best = 0.0
+    for token in _tokenize(t):
+        tok = token.lower()
+        # 片段内再做一次子串判断（query 命中某个词）
+        if q in tok or tok in q:
+            return 1.0
+        sim = difflib.SequenceMatcher(None, q, tok).ratio()
+        if sim > best:
+            best = sim
 
+    if best > 0.6:
+        return best * 0.8
     return 0.0
 
+
 # [近场提醒] 附加在"模型即将开始干活"的读操作返回末尾。
-# 目的：把"任务结束要写回索引"这一要求，从遥远的系统提示(CLAUDE.md)
-# 搬到模型实际调用工具的当下上下文里，降低收尾时的遗忘率。
-# 注意：仅在少数关键路径附加，避免到处都加导致模型对提醒脱敏。
+# 目的：把"任务结束要写回索引"从遥远的系统提示搬到模型当下的上下文里，降低遗忘率。
+# 仅在少数关键路径附加，避免到处都加导致脱敏。
 WRITEBACK_REMINDER = (
     "\n\n———\n"
     "⚠️ 收尾提醒：如果本次任务【改动了代码】或让你【对业务产生了新的理解】，"
     "请在结束前调用 update_business_index 把变更写回索引——否则本次任务视为未闭环。"
 )
 
+
+def _find_current(items: list, path_key: str, path_value: str):
+    """在列表中找到指定 path 的当前版本（is_current=True）。找不到返回 None。"""
+    for it in items:
+        if it.get(path_key) == path_value and it.get("is_current"):
+            return it
+    return None
+
+
 # --- MCP 工具定义 ---
 
 @mcp.tool()
 def search_business_index(keyword: str) -> str:
     """
-    [智能搜索] 根据关键词搜索索引。支持模糊匹配。
-    会优先匹配名称，其次是摘要。
-    keyword: 搜索词，如 "Payment", "登录", "UserSchema"
+    [智能搜索 · 分层兜底] 按关键词搜索业务索引，支持中文分词与模糊匹配。
+    检索策略（分两层）：
+      第一层：先在 module（代码层，当前版）里搜。若命中，直接返回这些代码模块。
+      第二层（兜底）：若 module 层一条都没命中，再从 workflow + decision（业务层）搜，
+                      因为用户的问法常是业务语言，可能只在业务描述里有字面重叠。
+                      业务层结果可能较多、较宽泛，需你自行筛选；选定后可用其 id 调 get_related 定位代码。
+    命中结果都会带上 id（组号），可据此用 get_related 追溯关联。
+    keyword: 搜索词，如 "Payment"、"登录"、"计费"。
     """
-    data = load_index()
-    results = []
+    def score_of(item):
+        name_score = calculate_match_score(keyword, item.get("name", "")) * 2
+        summary_score = calculate_match_score(keyword, item.get("summary", ""))
+        id_score = calculate_match_score(keyword, item.get("id", ""))
+        content_score = calculate_match_score(keyword, item.get("content", ""))
+        return max(name_score, summary_score, id_score, content_score)
 
-    def process_items(items, item_type):
-        for item in items:
-            name_score = calculate_match_score(keyword, item.get('name', '')) * 2
-            summary_score = calculate_match_score(keyword, item.get('summary', ''))
-            id_score = calculate_match_score(keyword, item.get('id', ''))
-            content_score = calculate_match_score(keyword, item.get('content', ''))
+    def collect(items, kind, current_only):
+        hits = []
+        for it in items:
+            if current_only and not it.get("is_current"):
+                continue
+            s = score_of(it)
+            if s > 0.4:
+                hits.append({"score": s, "kind": kind, "data": it})
+        return hits
 
-            score = max(name_score, summary_score, id_score, content_score)
+    # ---- 第一层：module ----
+    module_hits = collect(load_store("module"), "module", current_only=True)
+    if module_hits:
+        module_hits.sort(key=lambda x: x["score"], reverse=True)
+        payload = [{"kind": r["kind"], **r["data"]} for r in module_hits[:10]]
+        return json.dumps(payload, ensure_ascii=False, indent=2) + WRITEBACK_REMINDER
 
-            if score > 0.4:
-                results.append({
-                    "score": score,
-                    "type": item_type,
-                    "data": item
-                })
+    # ---- 第二层（兜底）：workflow + decision ----
+    biz_hits = []
+    biz_hits += collect(load_store("workflow"), "workflow", current_only=True)
+    biz_hits += collect(load_store("decision"), "decision", current_only=False)
 
-    process_items(data.get("modules", []), "module")
-    process_items(data.get("workflows", []), "workflow")
-    process_items(data.get("decisions", []), "decision")
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    top_results = [r["data"] for r in results[:10]]
-
-    if not top_results:
-        # [改动] 空结果不再是死胡同，而是一条明确的行动指令。
-        return (
-            f"🔍 索引中暂无与 '{keyword}' 相关的记录。\n"
-            f"这通常意味着该业务区域【尚未被索引】，而不是它不存在。\n"
-            f"正确做法：直接阅读相关源码理解其逻辑，理解后调用 update_business_index 把它记录下来，"
-            f"以便后续会话可以直接复用，而不必重新读代码。"
+    if biz_hits:
+        biz_hits.sort(key=lambda x: x["score"], reverse=True)
+        payload = [{"kind": r["kind"], **r["data"]} for r in biz_hits[:10]]
+        hint = (
+            "\n\n（说明：代码层(module)未直接命中，以下是从业务层(workflow/decision)兜底找到的结果，"
+            "可能较宽泛，请筛选；选定后可用其 id 调 get_related(id, \"module\") 定位对应代码。）"
         )
+        return json.dumps(payload, ensure_ascii=False, indent=2) + hint + WRITEBACK_REMINDER
 
-    # [改动] 命中结果时，在数据之后附加近场写回提醒。
-    # 这是模型基于索引开始干活的现场，原本此路径无任何提醒。
-    return json.dumps(top_results, ensure_ascii=False, indent=2) + WRITEBACK_REMINDER
+    # ---- 两层都无命中 ----
+    return (
+        f"🔍 索引中暂无与 '{keyword}' 相关的记录。\n"
+        f"这通常意味着该业务区域【尚未被索引】，而不是它不存在。\n"
+        f"正确做法：直接阅读相关源码理解其逻辑，理解后调用 update_business_index 把它记录下来，"
+        f"以便后续会话可以直接复用，而不必重新读代码。"
+    )
+
+
+@mcp.tool()
+def get_related(id: str, type: str = "") -> str:
+    """
+    [横向找因] 给定一个 id（组号），取出同一次因果事件的关联记录。
+    用途：当你搜到某个 module（果），想知道"为什么这么改"(decision) 或"对应什么业务语义"(workflow) 时调用。
+    - type 留空：返回该组号在三类中的所有记录。
+    - type 指定为 "module"/"workflow"/"decision"：只返回那一类（例如只想看决策就传 "decision"）。
+    无追溯关联的需求时不要调用本工具，以免徒增上下文。
+    """
+    if not id:
+        return "错误：必须提供 id（组号）。"
+
+    types = [type] if type in STORE_FILES else list(STORE_FILES.keys())
+    found = {}
+    for t in types:
+        hits = [rec for rec in load_store(t) if rec.get("id") == id]
+        if hits:
+            found[t] = hits
+
+    if not found:
+        return f"未找到 id 为 '{id}' 的关联记录。"
+    return json.dumps(found, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_version_history(path: str) -> str:
+    """
+    [纵向回溯] 给定 module 的 path，返回该模块的所有历史版本（含当前版），从新到旧排列。
+    用途：当你需要对比某个模块"改之前 vs 改之后"时调用（例如新业务有问题，想看旧实现做对照或混合开发）。
+    只返回 module 本身；若要看某个旧版本对应的业务语义/决策，再用那一版的 id 调 get_related。
+    无新旧对比需求时不要调用本工具。
+    """
+    if not path:
+        return "错误：必须提供 path。"
+
+    modules = load_store("module")
+    chain = [m for m in modules if m.get("path") == path]
+    if not chain:
+        return f"未找到 path 为 '{path}' 的模块历史。"
+
+    # 按时间从新到旧排序（last_updated 降序；缺失则靠后）
+    chain.sort(key=lambda m: m.get("last_updated", 0), reverse=True)
+    return json.dumps(chain, ensure_ascii=False, indent=2)
+
 
 @mcp.tool()
 def check_stale_indexes() -> str:
     """
-    [增强功能 2] 检查索引新鲜度。
-    对比文件系统的修改时间与索引的 'last_updated' 时间。
+    [新鲜度检查] 对比源文件修改时间与索引时间，找出可能过期的模块。
+    只检查 module 的当前版本。
     """
-    data = load_index()
-    modules = data.get("modules", [])
+    modules = load_store("module")
+    current_modules = [m for m in modules if m.get("is_current")]
 
-    # [改动] 优先区分"索引为空"与"有索引且都最新"，避免空索引时误报"一切最新"。
-    if not modules:
+    if not current_modules:
         return (
             "📭 业务索引目前为空。这是新项目的正常状态，并不代表本工具无效。\n"
             "你现在处于【索引建立期】：此阶段的首要任务不是检索，而是边理解代码边记录。\n"
@@ -155,107 +285,223 @@ def check_stale_indexes() -> str:
             "为后续会话积累可复用的项目记忆。"
         )
 
-    stale_items = []
-    for m in modules:
+    stale = []
+    for m in current_modules:
         path = m.get("path")
         last_updated = m.get("last_updated", 0)
-
         if path and os.path.exists(path):
             file_mtime = os.path.getmtime(path)
             if file_mtime > last_updated:
                 lag_hours = int((file_mtime - last_updated) / 3600)
-                stale_items.append(
-                    f"- {m.get('name')} (ID: {m.get('id')}): 代码已更新，索引滞后约 {lag_hours} 小时"
-                )
+                stale.append(f"- {m.get('name')} (path: {path}): 代码已更新，索引滞后约 {lag_hours} 小时")
 
-    if not stale_items:
-        # [改动] 此处模型即将基于现有索引开始干活，附加近场写回提醒。
+    if not stale:
         return "✅ 已索引的模块目前都是最新的（基于文件修改时间）。" + WRITEBACK_REMINDER
 
-    return "以下模块的索引可能已过期，建议读取代码并调用 update_business_index：\n" + "\n".join(stale_items)
+    return "以下模块的索引可能已过期，建议读取代码并调用 update_business_index：\n" + "\n".join(stale)
+
 
 @mcp.tool()
 def generate_architecture_diagram() -> str:
     """
-    [增强功能 3] 生成 Mermaid 格式的架构图代码。
-    展示模块依赖和工作流关系。
+    [架构图] 生成 Mermaid 依赖图，只展示当前版本的模块与工作流。
+    module 间依赖通过 dependencies 字段（存的是其他 module 的 path）解析。
     """
-    data = load_index()
-    mermaid = ["graph TD"]
+    modules = [m for m in load_store("module") if m.get("is_current")]
+    workflows = [w for w in load_store("workflow") if w.get("is_current")]
 
-    mermaid.append("    classDef module fill:#e1f5fe,stroke:#01579b,stroke-width:2px;")
-    mermaid.append("    classDef workflow fill:#fff3e0,stroke:#ff6f00,stroke-width:2px,stroke-dasharray: 5 5;")
+    # path -> 安全节点名 的映射（Mermaid 节点 id 不能有特殊字符，这里用序号代替）
+    path_to_node = {}
+    lines = ["graph TD"]
+    lines.append("    classDef module fill:#e1f5fe,stroke:#01579b,stroke-width:2px;")
+    lines.append("    classDef workflow fill:#fff3e0,stroke:#ff6f00,stroke-width:2px,stroke-dasharray: 5 5;")
 
-    for m in data.get("modules", []):
-        safe_name = m.get('name', 'Unknown').replace(" ", "_")
-        mermaid.append(f'    {m["id"]}["📦 {safe_name}"]:::module')
+    for idx, m in enumerate(modules):
+        node = f"m{idx}"
+        path_to_node[m.get("path")] = node
+        safe_name = (m.get("name") or "Unknown").replace(" ", "_")
+        lines.append(f'    {node}["📦 {safe_name}"]:::module')
 
-    for w in data.get("workflows", []):
-        safe_flow_name = w.get('name', 'Flow').replace(" ", "_")
-        flow_id = w.get("id", "flow_unk")
-        mermaid.append(f'    {flow_id}(["🔄 {safe_flow_name}"]):::workflow')
+    for idx, w in enumerate(workflows):
+        node = f"w{idx}"
+        safe_name = (w.get("name") or "Flow").replace(" ", "_")
+        lines.append(f'    {node}(["🔄 {safe_name}"]):::workflow')
+        # workflow 依赖的 module（按 path 关联）
+        for dep_path in w.get("dependencies", []):
+            target = path_to_node.get(dep_path)
+            if target:
+                lines.append(f"    {node} -.-> {target}")
 
-        for dep_id in w.get("dependencies", []):
-            mermaid.append(f'    {flow_id} -.-> {dep_id}')
+    # module 之间的依赖（按 path 关联）
+    for idx, m in enumerate(modules):
+        src = f"m{idx}"
+        for dep_path in m.get("dependencies", []):
+            target = path_to_node.get(dep_path)
+            if target and target != src:
+                lines.append(f"    {src} --> {target}")
 
-    return "\n".join(mermaid)
+    return "\n".join(lines)
+
+
+def _write_new_version(rec_type: str, path_key: str, new_data: dict, group_id: str, now: float):
+    """
+    为 module / workflow 写入一个新版本：
+    - 把同 path 的旧当前版 is_current 翻为 False；
+    - 新记录带 group_id、is_current=True、prev_id=旧当前版的 id。
+    """
+    items = load_store(rec_type)
+    path_value = new_data.get(path_key)
+
+    prev_id = None
+    for it in items:
+        if it.get(path_key) == path_value and it.get("is_current"):
+            it["is_current"] = False
+            prev_id = it.get("id")
+
+    record = dict(new_data)
+    record["id"] = group_id
+    record["is_current"] = True
+    record["prev_id"] = prev_id
+    record["last_updated"] = now
+    items.append(record)
+    save_store(rec_type, items)
+
 
 @mcp.tool()
 def update_business_index(updates: str) -> str:
     """
-    更新业务索引。
-    updates: JSON 字符串。会自动记录更新时间戳。
+    [写入索引] 记录一次业务理解或代码改动。updates 为 JSON 字符串（不要带 Markdown 标记）。
+    你【不需要、也不应该】提供任何 id，id 由系统自动生成。
+
+    模式 A —— 记录一次新改动（会生成新版本，三类共享同一个新 id/组号）：
+    {
+      "module":   {"path": "src/calc.py", "name": "计费计算", "summary": "单价×3",
+                   "key_functions": ["calc"], "dependencies": ["src/price.py"]},
+      "workflow": {"summary": "业务语义：单价乘数量"},          // 可选
+      "decision": {"content": "运营要求按单价×件数计费，故由累加改为乘法",
+                   "file_ref": "src/calc.py"}                  // 可选
+    }
+    说明：module 是主体（必填 path）；workflow 跟随 module（其 path 用 module 的 path）；
+    workflow/decision 可省略。三者共享本次生成的同一个 id。
+
+    模式 B —— 给某个【已存在的版本】补充 workflow/decision（不产生新 module 版本）：
+    {
+      "append_to_path": "src/calc.py",                          // 补到该 path 的当前版
+      "workflow": {...} 和/或 "decision": {...}
+    }
+    系统会找到该 path 当前版 module 的 id，把补充内容挂到同一个 id 下。
+    注意：模式 B 只能补到【当前版】。若补充的内容其实是针对某次旧改动的，
+    请在 decision 的 content 里明确写出"这是针对哪一次改动/哪一版的补充"，避免日后混淆。
     """
     try:
-        clean_updates = clean_json_string(updates)
-        update_obj = json.loads(clean_updates)
-
-        data = load_index()
-        u_type = update_obj.get("type")
-        u_data = update_obj.get("data")
-
-        if not u_data:
-            return "错误: 数据为空"
-
-        u_data["last_updated"] = time.time()
-
-        if u_type == "module":
-            data["modules"] = [
-                m for m in data["modules"]
-                if m.get("id") != u_data.get("id") and m.get("name") != u_data.get("name")
-            ]
-            data["modules"].append(u_data)
-
-        elif u_type == "workflow":
-            data["workflows"] = [
-                w for w in data["workflows"]
-                if w.get("id") != u_data.get("id") and w.get("name") != u_data.get("name")
-            ]
-            data["workflows"].append(u_data)
-
-        elif u_type == "decision":
-            if "id" in u_data:
-                data["decisions"] = [d for d in data["decisions"] if d.get("id") != u_data["id"]]
-            data["decisions"].append(u_data)
-
-        save_index(data)
-        return "索引更新成功并已备份。"
-
+        obj = json.loads(clean_json_string(updates))
     except Exception as e:
-        return f"更新失败: {str(e)}"
+        return f"更新失败：JSON 解析错误 - {e}"
+
+    now = time.time()
+
+    # ---------- 模式 B：补充到已有版本 ----------
+    if "append_to_path" in obj:
+        target_path = obj.get("append_to_path")
+        modules = load_store("module")
+        current = _find_current(modules, "path", target_path)
+        if not current:
+            return f"补充失败：未找到 path 为 '{target_path}' 的当前版本模块。请先用模式 A 记录该模块。"
+        group_id = current.get("id")
+
+        done = []
+        if "workflow" in obj and obj["workflow"]:
+            wf = load_store("workflow")
+            rec = dict(obj["workflow"])
+            rec["id"] = group_id
+            # 补充的 workflow 也作为当前版（沿用 module 的 path 作为关联键）
+            rec.setdefault("path", target_path)
+            rec["is_current"] = True
+            rec["prev_id"] = None
+            rec["last_updated"] = now
+            # 同 path 旧当前版降级
+            for it in wf:
+                if it.get("path") == target_path and it.get("is_current"):
+                    it["is_current"] = False
+                    rec["prev_id"] = it.get("id")
+            wf.append(rec)
+            save_store("workflow", wf)
+            done.append("workflow")
+
+        if "decision" in obj and obj["decision"]:
+            ds = load_store("decision")
+            rec = dict(obj["decision"])
+            rec["id"] = group_id
+            rec["last_updated"] = now
+            ds.append(rec)
+            save_store("decision", ds)
+            done.append("decision")
+
+        if not done:
+            return "补充失败：模式 B 至少需要提供 workflow 或 decision。"
+        return f"已补充 {', '.join(done)} 到 path '{target_path}'（id={group_id}）。"
+
+    # ---------- 模式 A：新改动 ----------
+    if "module" not in obj or not obj["module"]:
+        return "更新失败：模式 A 必须包含 module（且需含 path）。"
+    if not obj["module"].get("path"):
+        return "更新失败：module 必须包含 path 字段。"
+
+    group_id = generate_group_id()
+    module_path = obj["module"]["path"]
+
+    # module（必填）
+    _write_new_version("module", "path", obj["module"], group_id, now)
+
+    # workflow（可选）：path 跟随 module
+    if "workflow" in obj and obj["workflow"]:
+        wf_data = dict(obj["workflow"])
+        wf_data.setdefault("path", module_path)
+        _write_new_version("workflow", "path", wf_data, group_id, now)
+
+    # decision（可选）：纯追加，不做版本链
+    if "decision" in obj and obj["decision"]:
+        ds = load_store("decision")
+        rec = dict(obj["decision"])
+        rec["id"] = group_id
+        rec["last_updated"] = now
+        ds.append(rec)
+        save_store("decision", ds)
+
+    return f"索引更新成功（id={group_id}）。已写入并备份。"
+
 
 @mcp.tool()
 def get_business_index() -> str:
-    data = load_index()
+    """
+    [全量索引] 返回三类索引的全部内容（含历史版本）。成本高，仅在需要建立全局宏观认知时使用。
+    """
+    data = {
+        "modules": load_store("module"),
+        "workflows": load_store("workflow"),
+        "decisions": load_store("decision"),
+    }
     return json.dumps(data, ensure_ascii=False, indent=2)
+
 
 @mcp.tool()
 def validate_index() -> str:
-    data = load_index()
-    valid_modules = [m for m in data.get("modules", []) if os.path.exists(m.get("path", ""))]
-    data["modules"] = valid_modules
-    save_index(data)
-    return f"验证完成，现有有效模块 {len(valid_modules)} 个。"
+    """
+    [清理] 移除"源文件已不存在"的模块【当前版本】。历史版本予以保留（作为回溯资产）。
+    """
+    modules = load_store("module")
+    removed = 0
+    kept = []
+    for m in modules:
+        # 只清理"当前版且源文件已不存在"的记录；历史版无条件保留
+        if m.get("is_current") and not os.path.exists(m.get("path", "")):
+            removed += 1
+            continue
+        kept.append(m)
+    save_store("module", kept)
+    current_count = len([m for m in kept if m.get("is_current")])
+    return f"验证完成：移除了 {removed} 个失效的当前版模块，现有有效当前版模块 {current_count} 个（历史版本已保留）。"
+
 
 if __name__ == "__main__":
     mcp.run()

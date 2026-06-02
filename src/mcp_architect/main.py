@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import json
 import shutil
 import click
@@ -10,6 +11,11 @@ from pathlib import Path
 # 获取包内资源路径
 BASE_DIR = Path(__file__).parent
 TEMPLATE_DIR = BASE_DIR / "templates"
+
+# CLAUDE.md 注入区块的边界标记。
+# 架构师指令被包在这一对标记之间，使得后续 setup 能"只替换我们这段、不动用户内容"。
+MARKER_BEGIN = "<!-- BEGIN MCP-ARCHITECT (自动生成，请勿手动编辑此区块) -->"
+MARKER_END = "<!-- END MCP-ARCHITECT -->"
 
 
 @click.group()
@@ -52,11 +58,32 @@ def setup():
     with open(project_claude_md, "r", encoding="utf-8") as f:
         original_content = f.read()
 
-    # 简单的去重检查，防止重复追加
-    if "business_index_mcp" in original_content:
-        click.echo("⚠️  CLAUDE.md 似乎已经包含了架构师指令，跳过追加。")
+    # 用标记把架构师指令包起来，便于后续 setup 精确替换
+    wrapped_prompt = f"{MARKER_BEGIN}\n{architect_prompt}\n{MARKER_END}"
+
+    if MARKER_BEGIN in original_content and MARKER_END in original_content:
+        # 已有标记区块 -> 只替换标记之间的内容，用户其余内容原样保留
+        pattern = re.compile(
+            re.escape(MARKER_BEGIN) + r".*?" + re.escape(MARKER_END),
+            re.DOTALL,
+        )
+        new_content = pattern.sub(wrapped_prompt, original_content)
+        with open(project_claude_md, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        click.secho("✅ 已更新 CLAUDE.md 中的架构师指令区块（用户其余内容未改动）", fg="green")
+    elif "business_index_mcp" in original_content:
+        # 检测到【旧版无标记】的架构师指令：无法自动定位边界，避免误删用户内容，
+        # 这里采取保守策略——追加一段带标记的新版，并提醒用户手动删除旧的那段（仅此一次）。
+        new_content = original_content + "\n\n" + wrapped_prompt
+        with open(project_claude_md, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        click.secho("⚠️  检测到旧版（无标记）架构师指令。", fg="yellow")
+        click.echo("   已追加一段带标记的新版指令到文件末尾。")
+        click.echo("   请手动删除文件中【旧的那段】架构师指令（无标记的部分），以免新旧并存。")
+        click.echo("   此后再次 setup 将自动更新带标记的区块，无需再手动处理。")
     else:
-        new_content = original_content + "\n\n" + "-" * 20 + "\n\n" + architect_prompt
+        # 全新：直接追加带标记的区块
+        new_content = original_content + "\n\n" + wrapped_prompt
         with open(project_claude_md, "w", encoding="utf-8") as f:
             f.write(new_content)
         click.secho("✅ 已将架构师指令追加到 CLAUDE.md 末尾", fg="green")
