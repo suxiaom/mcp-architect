@@ -50,6 +50,25 @@ def read_stdin_json():
         return {}
 
 
+def emit_stderr(text: str):
+    """
+    按 UTF-8 写 stderr。
+    Windows 上 Python 默认用本地代码页(cp936/GBK)输出，而 Claude Code 按 UTF-8
+    读取并回显 hook 的 stderr，导致中文乱码。这里直接往二进制缓冲写 UTF-8 字节，
+    绕过文本层编码；缓冲不可用时退而重配 stderr 编码再输出。
+    """
+    data = text.encode("utf-8", errors="replace")
+    try:
+        sys.stderr.buffer.write(data)
+        sys.stderr.buffer.flush()
+    except (AttributeError, ValueError):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+        print(text, file=sys.stderr)
+
+
 def is_source_read(path_str: str) -> bool:
     """判断这次读取的文件是否算"理解了业务的源码"。"""
     if not path_str:
@@ -118,7 +137,7 @@ def cmd_gate(data):
         "它是 append-only、自动备份的非破坏性操作，直接写即可，无需向用户确认。\n"
         "（写回后本提示会自动消失。）"
     )
-    print(msg, file=sys.stderr)
+    emit_stderr(msg + "\n")
     sys.exit(2)
 
 
