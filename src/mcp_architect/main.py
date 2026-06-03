@@ -91,6 +91,9 @@ def setup():
     # --- 步骤 4: 通过 Claude Code 官方命令注册 MCP (scope=local) ---
     register_mcp_server(server_dst)
 
+    # --- 步骤 5: 部署"写回强制" Stop-hook (确定性兜底，不靠模型自觉) ---
+    setup_writeback_hooks(current_dir)
+
     click.echo("\n🎉 集成完成！请重新打开一个 Claude Code 会话使其生效。")
 
 
@@ -162,6 +165,95 @@ def _run_claude(cmd_list, is_windows: bool):
             capture_output=True, text=True, shell=True
         )
     return subprocess.run(cmd_list, capture_output=True, text=True)
+
+
+def setup_writeback_hooks(current_dir: Path):
+    """
+    部署"写回强制" Stop-hook 机制：投放 hook 脚本 + 幂等合并 .claude/settings.json。
+
+    机制（详见 writeback_hook.py 头注释）：
+    - SessionStart  -> reset：清掉残留标记
+    - PostToolUse(Read)                    -> mark：读源码就记一笔待写回
+    - PostToolUse(update_business_index)   -> clear：写回发生就清空
+    - Stop          -> gate：标记仍在则 exit 2 阻断结束，把指令喂回模型
+
+    设计要点：
+    - 解释器用 sys.executable（绝对路径、必然存在、只跑标准库），规避 Windows 上
+      hook 子进程 PATH 里找不到 python 的风险。
+    - 路径写绝对值，json.dump 自动转义 Windows 反斜杠。
+    - 幂等：合并前先剔除我们上次注入的条目（命令里含 writeback_hook.py 的），
+      再重新追加；用户已有的其它 hook 原样保留，不覆盖。
+    """
+    hook_src = BASE_DIR / "writeback_hook.py"
+    if not hook_src.exists():
+        click.secho("⚠️  未找到 writeback_hook.py，跳过写回 hook 部署。", fg="yellow")
+        return
+
+    hooks_dir = current_dir / ".claude" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook_dst = hooks_dir / "writeback_hook.py"
+    shutil.copy(hook_src, hook_dst)
+
+    py = sys.executable
+    script = str(hook_dst.resolve())
+
+    def cmd(sub: str) -> str:
+        # 解释器与脚本路径都加引号，兼容含空格的路径（如 Program Files）
+        return f'"{py}" "{script}" {sub}'
+
+    settings_path = current_dir / ".claude" / "settings.json"
+
+    # 读取并解析现有 settings（解析失败则备份后重写，避免污染用户配置）
+    settings = {}
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            bak = settings_path.with_suffix(".json.bak")
+            shutil.copy(settings_path, bak)
+            click.secho(f"⚠️  现有 settings.json 解析失败，已备份为 {bak.name} 后重写。", fg="yellow")
+            settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = settings["hooks"] = {}
+
+    def strip_ours(event: str) -> list:
+        """从某事件的现有 hook 组里，剔除我们之前注入的（命令含 writeback_hook.py），保留其余。"""
+        arr = hooks.get(event)
+        if not isinstance(arr, list):
+            return []
+        kept = []
+        for group in arr:
+            group_hooks = group.get("hooks") if isinstance(group, dict) else None
+            mine = isinstance(group_hooks, list) and any(
+                isinstance(h, dict) and "writeback_hook.py" in str(h.get("command", ""))
+                for h in group_hooks
+            )
+            if not mine:
+                kept.append(group)
+        return kept
+
+    hooks["SessionStart"] = strip_ours("SessionStart") + [
+        {"hooks": [{"type": "command", "command": cmd("reset")}]}
+    ]
+    hooks["PostToolUse"] = strip_ours("PostToolUse") + [
+        {"matcher": "Read", "hooks": [{"type": "command", "command": cmd("mark")}]},
+        {"matcher": "update_business_index", "hooks": [{"type": "command", "command": cmd("clear")}]},
+    ]
+    hooks["Stop"] = strip_ours("Stop") + [
+        {"hooks": [{"type": "command", "command": cmd("gate")}]}
+    ]
+
+    settings_path.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    click.secho("✅ 已部署写回强制 hook 并合并 .claude/settings.json（用户其它 hook 未改动）", fg="green")
+    click.echo(f"   脚本: {hook_dst}")
+    click.echo(f"   解释器: {py}")
 
 
 if __name__ == "__main__":
