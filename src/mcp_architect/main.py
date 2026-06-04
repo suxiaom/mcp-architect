@@ -169,13 +169,15 @@ def _run_claude(cmd_list, is_windows: bool):
 
 def setup_writeback_hooks(current_dir: Path):
     """
-    部署"写回强制" Stop-hook 机制：投放 hook 脚本 + 幂等合并 .claude/settings.json。
+    部署"索引强制" hook 机制：投放 hook 脚本 + 幂等合并 .claude/settings.json。
 
     机制（详见 writeback_hook.py 头注释）：
-    - SessionStart  -> reset：清掉残留标记
-    - PostToolUse(Read)                    -> mark：读源码就记一笔待写回
-    - PostToolUse(update_business_index)   -> clear：写回发生就清空
-    - Stop          -> gate：标记仍在则 exit 2 阻断结束，把指令喂回模型
+    - SessionStart                          -> reset：清掉残留标记
+    - UserPromptSubmit                      -> precheck：本会话没查过索引则注入"先查索引"提醒（非阻断）
+    - PostToolUse(索引读/写工具)             -> seen：置"已查过"标记，停止 precheck 提醒
+    - PostToolUse(Read)                     -> mark：读源码就记一笔待写回
+    - PostToolUse(update_business_index)    -> clear：写回发生就清空待写回
+    - Stop                                  -> gate：仍有待写回则 exit 2 阻断结束，把指令喂回模型
 
     设计要点：
     - 解释器用 sys.executable（绝对路径、必然存在、只跑标准库），规避 Windows 上
@@ -239,9 +241,14 @@ def setup_writeback_hooks(current_dir: Path):
     hooks["SessionStart"] = strip_ours("SessionStart") + [
         {"hooks": [{"type": "command", "command": cmd("reset")}]}
     ]
+    hooks["UserPromptSubmit"] = strip_ours("UserPromptSubmit") + [
+        {"hooks": [{"type": "command", "command": cmd("precheck")}]}
+    ]
     hooks["PostToolUse"] = strip_ours("PostToolUse") + [
         {"matcher": "Read", "hooks": [{"type": "command", "command": cmd("mark")}]},
         {"matcher": "update_business_index", "hooks": [{"type": "command", "command": cmd("clear")}]},
+        {"matcher": "search_business_index|check_stale_indexes|get_business_index|update_business_index",
+         "hooks": [{"type": "command", "command": cmd("seen")}]},
     ]
     hooks["Stop"] = strip_ours("Stop") + [
         {"hooks": [{"type": "command", "command": cmd("gate")}]}
@@ -251,7 +258,7 @@ def setup_writeback_hooks(current_dir: Path):
         json.dumps(settings, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    click.secho("✅ 已部署写回强制 hook 并合并 .claude/settings.json（用户其它 hook 未改动）", fg="green")
+    click.secho("✅ 已部署索引强制 hook（事前查索引 + 事后写回）并合并 .claude/settings.json（用户其它 hook 未改动）", fg="green")
     click.echo(f"   脚本: {hook_dst}")
     click.echo(f"   解释器: {py}")
 
