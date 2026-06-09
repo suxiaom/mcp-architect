@@ -40,6 +40,11 @@ STORE_FILES = {
     "decision": BASE_DIR / "decisions.json",
 }
 
+# 层面二兜底：工具返回序列化后的字符数上限。
+# Claude Code 对工具返回有 token 上限（约 17 万字符量级），超限会被落盘+逼分块读。
+# 这里留足安全余量设为 10 万，作为纯兜底——正常的 m+w 精简缩影远小于此，基本碰不到。
+MAX_OUTPUT_CHARS = 100_000
+
 # ============================================================
 # 数据模型约定（重要，便于理解下面的代码）
 # ------------------------------------------------------------
@@ -80,6 +85,41 @@ def save_store(rec_type: str, items: list):
         shutil.copy(path, str(path) + ".bak")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
+
+
+def _dump_capped(data: dict) -> str:
+    """
+    层面二兜底：序列化 data；若超过 MAX_OUTPUT_CHARS，则按【整条记录】边界
+    丢弃尾部记录（绝不切碎任何单条记录的内容），并附明确提示告知省略条数与按需查询方式。
+
+    data 形如 {"modules": [...], "workflows": [...]}。
+    正常 m+w 精简缩影远小于上限，此函数基本不触发；仅为极端大库兜底，
+    且只会"少给几条 + 告诉你怎么取剩下的"，不会破坏 JSON、也不会切碎单条内容。
+    """
+    full = json.dumps(data, ensure_ascii=False, indent=2)
+    if len(full) <= MAX_OUTPUT_CHARS:
+        return full
+
+    limit = MAX_OUTPUT_CHARS - 600  # 预留末尾提示文字的余量
+    out = {k: [] for k in data}
+    omitted = {k: 0 for k in data}
+    stop = False
+    for key, records in data.items():
+        for rec in records:
+            if stop:
+                omitted[key] += 1
+                continue
+            out[key].append(rec)
+            if len(json.dumps(out, ensure_ascii=False, indent=2)) > limit:
+                out[key].pop()        # 回退这条，保证不超限；它及其后全部计入省略
+                omitted[key] += 1
+                stop = True
+    out["_truncated"] = {
+        "reason": f"内容超过 {MAX_OUTPUT_CHARS} 字符上限，已按整条记录边界省略尾部记录（未切碎任何单条内容）。",
+        "omitted": {k: v for k, v in omitted.items() if v},
+        "next": "用 search_business_index 按关键词精确查询被省略的部分；拿到 id 后用 get_related 取完整记录。",
+    }
+    return json.dumps(out, ensure_ascii=False, indent=2)
 
 
 def generate_group_id() -> str:
@@ -482,14 +522,26 @@ def update_business_index(updates: str) -> str:
 @mcp.tool()
 def get_business_index() -> str:
     """
-    [全量索引] 返回三类索引的全部内容（含历史版本）。成本高，仅在需要建立全局宏观认知时使用。
+    [现状地图] 返回当前版 module 与 workflow 的精简缩影。
+    内容：
+      - module：id + name + summary
+      - workflow：id + summary
+    刻意【不含 decision、不含历史版本】，因此体积小、不会再因过大而失败。
+
+    用途：建立项目全局现状认知——"现在有哪些模块、各自干嘛、对应什么业务语义"。
+    要进一步钻取（本工具只给"果"和"业务语义"，不给"为什么"和"演进"）：
+      - 想知道某处"当初为什么这么改" → 用该记录的 id 调 get_related(id, "decision")。
+      - 想看某模块"改之前长什么样 / 演进过程" → 用其 path 调 get_version_history(path)。
     """
-    data = {
-        "modules": load_store("module"),
-        "workflows": load_store("workflow"),
-        "decisions": load_store("decision"),
-    }
-    return json.dumps(data, ensure_ascii=False, indent=2)
+    modules = [
+        {"id": m.get("id"), "name": m.get("name"), "summary": m.get("summary")}
+        for m in load_store("module") if m.get("is_current")
+    ]
+    workflows = [
+        {"id": w.get("id"), "summary": w.get("summary")}
+        for w in load_store("workflow") if w.get("is_current")
+    ]
+    return _dump_capped({"modules": modules, "workflows": workflows})
 
 
 @mcp.tool()

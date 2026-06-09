@@ -51,7 +51,7 @@
 2.  **精准检索**：调用 `search_business_index` 用关键词定位。
     - 返回"暂无记录" → 见铁律一：读源码理解后立即写回，再继续手头任务。
     - 命中结果会带 `id`（组号）。需要知道"这段代码为什么是现在这样"时，用该 id 调 `get_related` 取 workflow/decision。
-    - *仅在需要全局宏观认知时，才调用高成本的 `get_business_index`。*
+    - *需要全局现状认知时，调用 `get_business_index` 取「现状地图」——当前版 module + workflow 的精简缩影（id + 名称/摘要），不含 decision 与历史。想知道某处"为什么这么改"用 `get_related(id, "decision")`；想看某模块的演进/旧版用 `get_version_history(path)`。*
 3.  **辅助视图（可选）**：涉及复杂依赖时调用 `generate_architecture_diagram`。
 
 ### 2. 任务结束（落账）
